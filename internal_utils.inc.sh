@@ -6,7 +6,7 @@ SCP_ARGS="$SSH_ARGS"
 INIT() {
   mkdir -p "$RUNS_IN_DIR" || ERROR "while attempting to create store dir"
   mkdir -p "$TMP_RCV_DIR" || ERROR "while attempting to create rcv dir"
-  if id $RUN_AS_USER; then : ; else ERROR "intended user not found"; fi
+  if id $RUNS_AS_USER >/dev/null; then : ; else ERROR "intended user not found"; fi
   hostname >>$RUNS_IN_DIR/nodelist.txt
   CHECK_NODE_CONNECTIVITY
 }
@@ -48,7 +48,20 @@ PUT_NEW_OBJECT() {
 DISTRIBUTE_FILES () {
   while [ "$1" != "" ]; do 
     for i in `seq 1 $NUMBER_OF_REPLICAS`; do
-      node=`sort -R "$RUNS_IN_DIR/nodelist.txt" | head -n 1`
+      case "$DISTRIBUTION_ALGORITHM" in
+        "random")
+          node=`sort -R "$RUNS_IN_DIR/nodelist.txt" | head -n 1`
+          ;;
+        "mod_rotate")
+          num_nodes=`wc -l "$RUNS_IN_DIR/nodelist.txt" | cut -f 1 -d ' '`
+          basename=`basename "$1"`
+          char="${basename:$((i-1)):$i}"
+          node_line_no=$(( 1 + $(printf %d \'$char) % $num_nodes ))
+          node=`sed -ne ${node_line_no}p $RUNS_IN_DIR/nodelist.txt`
+          ;;
+        *)
+          ERROR "no valid distribution algorithm specified"
+      esac
       SEND_FILE_TO_NODE "$node" "$1"
       if [ $? -ne 0 ]; then
         ERROR "while distributing files"
@@ -76,7 +89,7 @@ GET_LIST_OF_ALL_OBJECTS() {
   all_lists=""
   for node in `cat $RUNS_IN_DIR/nodelist.txt`; do
     one_list=`GET_FILE_LIST_FROM_NODE "$node"`
-    all_lists=`echo -e "$all_lists\n$one_list"`
+    all_lists=`echo -e "${all_lists}${all_lists:+\n}${one_list}"`
   done
   all_lists=`sed -e 's/\.gz\..*//' -e "s_^.*/__" <<<"$all_lists" | sort -u`
   echo "$all_lists"
@@ -95,8 +108,9 @@ GET_OBJECT_CONTENTS() {
     node_files=`ssh \
                  $SSH_ARGS                                       \
                  "$node"                                         \
-                 find "$RUNS_IN_DIR" -maxdepth 1 -name "*.gz.*"  \
-                | grep "$object_prefix" | sed -e "s/^/$node /"`
+                 "find \"$RUNS_IN_DIR\" -maxdepth 1 -name \"*.gz.*\" \
+                    | grep \"$object_prefix\"                        \
+                    | sed -e \"s/^/$node /\""`
 
     all_node_files=`echo -ne "$node_files\n$all_node_files"`
   done
@@ -104,15 +118,17 @@ GET_OBJECT_CONTENTS() {
   node_object_sources=`echo "$all_node_files" \
                         | sort -R             \
                         | sort -k 2           \
-                        | uniq -f 2           \
+                        | uniq -f 1           \
                         | tr ' ' ':'`
+  # TODO: Add debug option for this sort of thing:
+  echo "Getting object, sources: $node_object_sources" >&2
   (
   for entry in $node_object_sources; do
     target_node=${entry%%:*}
     target_file=${entry##*:}
     ssh \
      $SSH_ARGS                                 \
-     "$RUNS_AS_USER@$node"                     \
+     "$RUNS_AS_USER@$target_node"              \
      cat "$target_file"
   done
   ) | gzip -d -c 
